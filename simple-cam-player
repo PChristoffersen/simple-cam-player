@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+
+import argparse
+import argcomplete
+from enum import Enum
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gtk, Gio, Gdk, Gst  # noqa: E402
+
+
+V4LSRC_IOMODE="mmap"
+
+Gst.init(None)
+
+class Format(Enum):
+    RAW = "raw"
+    RAW_NV12 = "nv12"
+    JPEG = "jpeg"
+    JPEGNV = "jpeg-nv"
+    JPEGSW = "jpeg-sw"
+    H264 = "h264"
+
+class MyApplication(Gtk.Application):
+    DEFAULT_WIDTH = 1280
+    DEFAULT_HEIGHT = 720
+    MINIMUM_WIDTH = 320
+    MINIMUM_HEIGHT = 240
+
+    def __init__(self, device=None, resolution=None, framerate=None, format=Format.RAW, fixed=False):
+        super().__init__(application_id="com.example.HelloGTK", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.device = device
+        self.resolution = resolution
+        self.framerate = framerate
+        self.format = format
+        self.fixed = fixed
+        self.frame_width = None
+        self.frame_height = None
+        self.first_caps_received = False
+        self.window = None
+        self.pipeline = None
+        self.is_fullscreen = False
+        self.connect("activate", self.on_activate)
+
+    def on_activate(self, app):
+        win = Gtk.ApplicationWindow(application=app)
+        self.window = win  # Store reference for caps callback
+        win.set_title("Webcam Viewer")
+        win.set_default_size(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT)
+        win.set_decorated(False)
+        win.set_resizable(True)
+        win.set_size_request(self.MINIMUM_WIDTH, self.MINIMUM_HEIGHT)
+
+        # Add CSS for rounded corners
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(b"""
+            window {
+                border-radius: 10px;
+                background-color: black;
+            }
+            picture {
+                background-color: black;
+            }
+        """)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        # Create GStreamer pipeline
+        self.create_pipeline()
+
+        # Get the paintable from the sink
+        sink = self.pipeline.get_by_name("sink")
+        paintable = sink.get_property("paintable")
+        
+        # Create GTK Picture widget to display the paintable
+        picture = Gtk.Picture.new_for_paintable(paintable)
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+
+        # Add gesture for resizing
+        if not self.fixed:
+            click = Gtk.GestureClick.new()
+            click.set_button(1)
+            click.connect("pressed", self.on_resize_pressed, win)
+            
+            motion = Gtk.EventControllerMotion.new()
+            motion.connect("motion", self.on_motion, win)
+            
+            win.add_controller(click)
+            win.add_controller(motion)
+
+        # Add keyboard controller for quit
+        key_controller = Gtk.EventControllerKey.new()
+        key_controller.connect("key-pressed", self.on_key_pressed, win)
+        win.add_controller(key_controller)
+
+        handle = Gtk.WindowHandle()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(picture)
+        
+        handle.set_child(box)
+        win.set_child(handle)
+        
+        # Start the pipeline
+        self.pipeline.set_state(Gst.State.PLAYING)
+        
+        win.present()
+
+
+    def create_pipeline(self):
+        # Connfigure source
+        source_str = f"v4l2src io-mode={V4LSRC_IOMODE} name=source"
+        if self.device:
+            source_str += f" device={self.device}"
+
+
+        # Configure format
+        if self.format == Format.RAW:
+            format_str = "video/x-raw"
+            decoder_str = "videoconvert"
+        elif self.format == Format.RAW_NV12:
+            format_str = "video/x-raw,format=NV12"
+            decoder_str = "videoconvert"
+        elif self.format == Format.JPEG:
+            format_str = "image/jpeg"
+            decoder_str = "avdec_mjpeg name=decoder"
+        elif self.format == Format.JPEGNV:
+            format_str = "image/jpeg"
+            decoder_str = "nvjpegdec name=decoder"
+        elif self.format == Format.JPEGSW:
+            format_str = "image/jpeg"
+            decoder_str = "jpegdec name=decoder"
+        elif self.format == Format.H264:
+            format_str = "video/x-h264"
+            decoder_str = "avdec_h264 name=decoder"
+        else:
+            raise ValueError(f"Unsupported format: {self.format}")
+
+        if self.resolution:
+            try:
+                video_width, video_height = map(int, self.resolution.split('x'))
+                format_str += f",width={video_width},height={video_height}"
+            except ValueError:
+                print(f"Invalid resolution format: {self.resolution}. Using default")
+        
+        if self.framerate:
+            try:
+                framerate = int(self.framerate)
+                format_str += f",framerate={framerate}/1"
+            except ValueError:
+                print(f"Invalid framerate: {self.framerate}. Using default")
+
+        # Configure sink
+        sink_str = "gtk4paintablesink name=sink"
+
+        print(f"Using format: {format_str}")
+
+
+        pipeline_str = f"{source_str} ! {format_str}"
+        if decoder_str:
+            pipeline_str += f" ! {decoder_str}"
+        pipeline_str += f" ! {sink_str}"
+        #print(f">{pipeline_str}<")
+
+        # Create GStreamer pipeline
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        
+        # Get the sink and connect to notify::caps signal
+        source = self.pipeline.get_by_name("source")
+        sourcepad = source.get_static_pad("src")
+        sourcepad.connect("notify::caps", self.on_source_caps_changed)
+
+        sink = self.pipeline.get_by_name("sink")
+        sinkpad = sink.get_static_pad("sink")
+        sinkpad.connect("notify::caps", self.on_sink_caps_changed)
+
+
+    def on_source_caps_changed(self, pad, param):
+        caps = pad.get_current_caps()
+        if caps:
+            print(f"Source Caps: {caps.to_string()}")
+
+    def on_sink_caps_changed(self, pad, param):
+        caps = pad.get_current_caps()
+        if caps:
+            structure = caps.get_structure(0)
+            self.frame_width = structure.get_int("width")[1]
+            self.frame_height = structure.get_int("height")[1]
+            print(f"Sink Caps: {caps.to_string()}")
+
+            # Update window size to match video resolution
+            self.window.set_default_size(self.frame_width, self.frame_height)
+            self.first_caps_received = True
+
+    def on_motion(self, controller, x, y, win):
+        if self.is_fullscreen:
+            return
+        
+        width = win.get_width()
+        height = win.get_height()
+        edge_size = 10
+        
+        cursor = None
+        if x < edge_size and y < edge_size:
+            cursor = "nw-resize"
+        elif x > width - edge_size and y < edge_size:
+            cursor = "ne-resize"
+        elif x < edge_size and y > height - edge_size:
+            cursor = "sw-resize"
+        elif x > width - edge_size and y > height - edge_size:
+            cursor = "se-resize"
+        elif x < edge_size:
+            cursor = "w-resize"
+        elif x > width - edge_size:
+            cursor = "e-resize"
+        elif y < edge_size:
+            cursor = "n-resize"
+        elif y > height - edge_size:
+            cursor = "s-resize"
+        
+        if cursor:
+            win.set_cursor(Gdk.Cursor.new_from_name(cursor))
+        else:
+            win.set_cursor(None)
+
+    def on_resize_pressed(self, gesture, n_press, x, y, win):
+        width = win.get_width()
+        height = win.get_height()
+        edge_size = 10
+        
+        edge = Gdk.SurfaceEdge.SOUTH_EAST
+        if x < edge_size and y < edge_size:
+            edge = Gdk.SurfaceEdge.NORTH_WEST
+        elif x > width - edge_size and y < edge_size:
+            edge = Gdk.SurfaceEdge.NORTH_EAST
+        elif x < edge_size and y > height - edge_size:
+            edge = Gdk.SurfaceEdge.SOUTH_WEST
+        elif x > width - edge_size and y > height - edge_size:
+            edge = Gdk.SurfaceEdge.SOUTH_EAST
+        elif x < edge_size:
+            edge = Gdk.SurfaceEdge.WEST
+        elif x > width - edge_size:
+            edge = Gdk.SurfaceEdge.EAST
+        elif y < edge_size:
+            edge = Gdk.SurfaceEdge.NORTH
+        elif y > height - edge_size:
+            edge = Gdk.SurfaceEdge.SOUTH
+        else:
+            return
+        
+        surface = win.get_surface()
+        if surface:
+            device = gesture.get_device()
+            surface.begin_resize(edge, device, 1, x, y, gesture.get_current_event_time())
+
+
+    def on_key_pressed(self, controller, keyval, keycode, state, win):
+        if keyval == Gdk.KEY_q:
+            self.pipeline.set_state(Gst.State.NULL)
+            win.close()
+            return True
+        if keyval == Gdk.KEY_F11 or keyval == Gdk.KEY_f:
+            self.set_fullscreen(not self.is_fullscreen)
+            return True
+        if keyval == Gdk.KEY_Escape:
+            self.set_fullscreen(False)
+            return True
+        if keyval == Gdk.KEY_1:
+            if self.first_caps_received:
+                self.resize_window(self.frame_width, self.frame_height)
+            return True
+        if keyval == Gdk.KEY_2:
+            if self.first_caps_received:
+                self.resize_window(int(self.frame_width/2), int(self.frame_height/2))
+            return True
+        if keyval == Gdk.KEY_3:
+            if self.first_caps_received:
+                self.resize_window(int(self.frame_width/3), int(self.frame_height/3))
+            return True
+        if keyval == Gdk.KEY_4:
+            if self.first_caps_received:
+                self.resize_window(int(self.frame_width/4), int(self.frame_height/4))
+            return True
+        if keyval == Gdk.KEY_9:
+            if self.first_caps_received:
+                self.resize_window(1280, 720)
+            return True
+        if keyval == Gdk.KEY_0:
+            if self.first_caps_received:
+                self.resize_window(1920, 1080)
+            return True
+        return False
+
+
+    def set_fullscreen(self, fullscreen: bool):
+        if self.window and fullscreen != self.is_fullscreen:
+            print(f"Setting fullscreen: {fullscreen}")
+            if fullscreen:
+                self.window.fullscreen()
+                self.window.set_cursor(Gdk.Cursor.new_from_name("none"))
+                self.is_fullscreen = True
+            else:
+                self.window.unfullscreen()
+                self.window.set_cursor(None)
+                self.is_fullscreen = False
+
+    def resize_window(self, width, height):
+        if self.window:
+            print(f"Resizing to {width}x{height}")
+            self.window.set_default_size(width, height)
+            self.window.set_size_request(width, height)
+            surface = self.window.get_surface()
+            if surface:
+                surface.request_layout()
+            self.window.set_size_request(self.MINIMUM_WIDTH, self.MINIMUM_HEIGHT)
+
+
+def show_caps_info(device=None):
+    # Create a temporary pipeline to query caps
+    device_str = f"device={device}" if device else ""
+    pipeline = Gst.parse_launch(f"v4l2src io-mode={V4LSRC_IOMODE} name=source {device_str} ! fakesink")
+    source = pipeline.get_by_name("source")
+    src_pad = source.get_static_pad("src")
+
+    pipeline.set_state(Gst.State.PAUSED)
+
+    # Wait for the pipeline to preroll
+    ret, state, pending = pipeline.get_state(Gst.CLOCK_TIME_NONE)
+    if ret == Gst.StateChangeReturn.FAILURE:
+        print("Failed to preroll pipeline")
+        pipeline.set_state(Gst.State.NULL)
+        return
+
+    caps = src_pad.query_caps(None)
+    
+    print("Available caps from v4l2src:")
+    for i in range(caps.get_size()):
+        structure = caps.get_structure(i)
+        print(f"  {structure.to_string()}")
+    
+    pipeline.set_state(Gst.State.NULL)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Webcam Viewer')
+    parser.add_argument('--show-caps', action='store_true', help='Show video capabilities information')
+    parser.add_argument('--device', type=str, help='Video device path (e.g., /dev/video0)')
+    parser.add_argument('--resolution', type=str, help='Video resolution (e.g., 1920x1080, 1280x720)')
+    parser.add_argument('--framerate', type=int, help='Video framerate (e.g., 30, 60)')
+    parser.add_argument('--format', type=str, choices=[str(format.value) for format in Format], default=Format.JPEG.value, help='Video format (raw or jpeg)')
+    parser.add_argument('--fixed', action='store_true', help='Disable window resizing')
+    
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    if args.show_caps:
+        show_caps_info(device=args.device)
+        exit(0)
+
+    app = MyApplication(device=args.device, resolution=args.resolution, framerate=args.framerate, format=Format(args.format), fixed=args.fixed)
+    app.run(None)
